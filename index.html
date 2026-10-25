@@ -65,7 +65,7 @@
     </div>
   </main>
 
-  <!-- Mobile Script Logic -->
+  <!-- Mobile Script Logic with TURN Servers & Full Features -->
   <script>
     const urlParams = new URLSearchParams(window.location.search);
     const roomId = urlParams.get('roomId');
@@ -118,9 +118,8 @@
         localVideo.srcObject = localStream;
         await localVideo.play();
 
-        // If already connected via PeerJS, replace stream in ongoing call
         if (currentCall && peer) {
-          const sender = currentCall.peerConnection.getSenders().find(s => s.track.kind === 'video');
+          const sender = currentCall.peerConnection.getSenders().find(s => s.track && s.track.kind === 'video');
           if (sender) {
             sender.replaceTrack(localStream.getVideoTracks()[0]);
           }
@@ -162,7 +161,9 @@
         config: {
           iceServers: [
             { urls: 'stun:stun.l.google.com:19302' },
-            { urls: 'stun:stun1.l.google.com:19302' }
+            { urls: 'stun:stun1.l.google.com:19302' },
+            { urls: 'turn:openrelay.metered.ca:80', username: 'openrelay', credential: 'openrelay' },
+            { urls: 'turn:openrelay.metered.ca:443', username: 'openrelay', credential: 'openrelay' }
           ]
         }
       });
@@ -171,11 +172,9 @@
         connStatus.className = "inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30";
         connStatus.innerHTML = `<span class="w-2 h-2 rounded-full bg-emerald-400"></span> Connected`;
 
-        // Call host with media stream
         currentCall = peer.call(hostId, localStream);
         currentCall.on('close', () => updateDisconnectedState());
 
-        // Connect data channel for triggers
         dataConn = peer.connect(hostId);
         dataConn.on('data', (packet) => {
           if (packet.type === 'TRIGGER_HIGH_RES_CAPTURE') {
