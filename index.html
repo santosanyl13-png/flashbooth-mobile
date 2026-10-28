@@ -65,8 +65,28 @@
     </div>
   </main>
 
-  <!-- Mobile Script Logic with TURN Servers & Full Features -->
+  <!-- Mobile Script Logic with TURN Servers, Reconnect Handling & Full Features -->
   <script>
+    // --- Configuration -----------------------------------------------
+    // Free/rate-limited demo TURN relay — fine for testing, swap for a
+    // paid TURN provider (Twilio, Xirsys, metered.ca paid tier, or a
+    // self-hosted coturn instance) before relying on this at a real event.
+    const ICE_SERVERS = [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'turn:openrelay.metered.ca:80', username: 'openrelay', credential: 'openrelay' },
+      { urls: 'turn:openrelay.metered.ca:443', username: 'openrelay', credential: 'openrelay' }
+    ];
+    const MAX_RECONNECT_ATTEMPTS = 5;
+
+    // Live preview quality tuning. Without these, the browser's WebRTC
+    // encoder picks its own (often conservative) bitrate/resolution
+    // trade-off, which is why the PC's live preview can look noticeably
+    // softer than what the phone's camera actually sees — the final
+    // capture bypasses this encoder entirely so it isn't affected.
+    const VIDEO_MAX_BITRATE_BPS = 3000000; // ~3 Mbps cap: generous for a sharp 1080p feed, not so high it floods event wifi
+    const VIDEO_FRAME_RATE = { ideal: 20, max: 30 }; // photobooth subjects are posed, not fast-moving — trade smoothness for sharpness
+
     const urlParams = new URLSearchParams(window.location.search);
     const roomId = urlParams.get('roomId');
 
@@ -74,13 +94,55 @@
     const captureCanvas = document.getElementById('captureCanvas');
     const connStatus = document.getElementById('connStatus');
     const startOverlay = document.getElementById('startOverlay');
-    
+
     let localStream = null;
     let peer = null;
     let dataConn = null;
     let currentCall = null;
     let isGridOn = false;
     let useFrontCamera = true;
+
+    let currentHostId = null;
+    let reconnectAttempts = 0;
+    let reconnectTimer = null;
+
+    // Hints the browser to favor per-frame sharpness over motion smoothness
+    // for this track — the right trade-off for a photobooth preview.
+    function applyTrackContentHint(stream) {
+      if (!stream) return;
+      const videoTrack = stream.getVideoTracks()[0];
+      if (videoTrack && 'contentHint' in videoTrack) {
+        videoTrack.contentHint = 'detail';
+      }
+    }
+
+    // Raises the video encoder's bitrate ceiling and tells it to protect
+    // resolution (rather than silently downscaling) if bandwidth gets
+    // tight. Safe to call before ICE negotiation finishes; browsers apply
+    // it once the encoder starts. Wrapped defensively since setParameters
+    // support/behavior varies slightly across mobile browsers.
+    function applyVideoSenderQualityHints(call) {
+      try {
+        const pc = call && call.peerConnection;
+        if (!pc) return;
+        const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+        if (!sender) return;
+
+        const params = sender.getParameters();
+        if (!params.encodings || params.encodings.length === 0) {
+          params.encodings = [{}];
+        }
+        params.encodings[0].maxBitrate = VIDEO_MAX_BITRATE_BPS;
+        params.degradationPreference = 'maintain-resolution';
+
+        const result = sender.setParameters(params);
+        if (result && typeof result.catch === 'function') {
+          result.catch((err) => console.log('Could not apply video sender quality hints:', err));
+        }
+      } catch (err) {
+        console.log('Could not apply video sender quality hints:', err);
+      }
+    }
 
     function toggleMobileGrid() {
       isGridOn = !isGridOn;
@@ -110,10 +172,13 @@
           video: {
             facingMode: useFrontCamera ? 'user' : 'environment',
             width: { ideal: 1920 },
-            height: { ideal: 1080 }
+            height: { ideal: 1080 },
+            frameRate: VIDEO_FRAME_RATE
           },
           audio: false
         });
+
+        applyTrackContentHint(localStream);
 
         localVideo.srcObject = localStream;
         await localVideo.play();
@@ -121,7 +186,9 @@
         if (currentCall && peer) {
           const sender = currentCall.peerConnection.getSenders().find(s => s.track && s.track.kind === 'video');
           if (sender) {
-            sender.replaceTrack(localStream.getVideoTracks()[0]);
+            await sender.replaceTrack(localStream.getVideoTracks()[0]);
+            // replaceTrack can reset encoding parameters on some browsers, so reapply them.
+            applyVideoSenderQualityHints(currentCall);
           }
         }
       } catch (err) {
@@ -140,10 +207,13 @@
           video: {
             facingMode: useFrontCamera ? 'user' : 'environment',
             width: { ideal: 1920 },
-            height: { ideal: 1080 }
+            height: { ideal: 1080 },
+            frameRate: VIDEO_FRAME_RATE
           },
           audio: false
         });
+
+        applyTrackContentHint(localStream);
 
         localVideo.srcObject = localStream;
         await localVideo.play();
@@ -156,37 +226,76 @@
     }
 
     function connectToHostPeer(hostId) {
+      currentHostId = hostId;
+      reconnectAttempts = 0;
+
       peer = new Peer({
         debug: 1,
-        config: {
-          iceServers: [
-            { urls: 'stun:stun.l.google.com:19302' },
-            { urls: 'stun:stun1.l.google.com:19302' },
-            { urls: 'turn:openrelay.metered.ca:80', username: 'openrelay', credential: 'openrelay' },
-            { urls: 'turn:openrelay.metered.ca:443', username: 'openrelay', credential: 'openrelay' }
-          ]
-        }
+        config: { iceServers: ICE_SERVERS }
       });
 
-      peer.on('open', (id) => {
-        connStatus.className = "inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30";
-        connStatus.innerHTML = `<span class="w-2 h-2 rounded-full bg-emerald-400"></span> Connected`;
+      peer.on('open', () => {
+        reconnectAttempts = 0;
+        setConnStatus('connected');
+        startCallAndData(hostId);
+      });
 
-        currentCall = peer.call(hostId, localStream);
-        currentCall.on('close', () => updateDisconnectedState());
-
-        dataConn = peer.connect(hostId);
-        dataConn.on('data', (packet) => {
-          if (packet.type === 'TRIGGER_HIGH_RES_CAPTURE') {
-            captureAndSendHighResPhoto();
-          }
-        });
+      peer.on('disconnected', () => {
+        // Signaling connection to PeerJS's broker dropped (wifi hiccup, phone
+        // sleep). The WebRTC call may still survive briefly; try to bring the
+        // signaling channel back without making the user re-scan the QR code.
+        setConnStatus('reconnecting');
+        scheduleReconnect();
       });
 
       peer.on('error', (err) => {
         console.error('Peer error:', err);
-        updateDisconnectedState();
+        setConnStatus('reconnecting');
+        scheduleReconnect();
       });
+
+      peer.on('close', () => {
+        setConnStatus('disconnected');
+      });
+    }
+
+    function startCallAndData(hostId) {
+      currentCall = peer.call(hostId, localStream);
+      applyVideoSenderQualityHints(currentCall);
+      currentCall.on('close', () => {
+        setConnStatus('reconnecting');
+        scheduleReconnect();
+      });
+
+      dataConn = peer.connect(hostId);
+      dataConn.on('data', (packet) => {
+        if (packet.type === 'TRIGGER_HIGH_RES_CAPTURE') {
+          captureAndSendHighResPhoto();
+        }
+      });
+    }
+
+    function scheduleReconnect() {
+      if (reconnectTimer) return; // a retry is already pending
+
+      if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+        setConnStatus('failed');
+        return;
+      }
+
+      reconnectAttempts++;
+      const delay = Math.min(1000 * reconnectAttempts, 5000); // simple backoff, capped at 5s
+
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        if (!peer || peer.destroyed) return;
+
+        if (peer.disconnected) {
+          peer.reconnect();
+        } else if (currentHostId) {
+          startCallAndData(currentHostId);
+        }
+      }, delay);
     }
 
     function captureAndSendHighResPhoto() {
@@ -212,9 +321,20 @@
       }
     }
 
-    function updateDisconnectedState() {
-      connStatus.className = "inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-red-500/20 text-red-400 border border-red-500/30";
-      connStatus.innerHTML = `<span class="w-2 h-2 rounded-full bg-red-400 animate-pulse"></span> Disconnected`;
+    function setConnStatus(state) {
+      if (state === 'connected') {
+        connStatus.className = "inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30";
+        connStatus.innerHTML = `<span class="w-2 h-2 rounded-full bg-emerald-400"></span> Connected`;
+      } else if (state === 'reconnecting') {
+        connStatus.className = "inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-amber-500/20 text-amber-400 border border-amber-500/30";
+        connStatus.innerHTML = `<span class="w-2 h-2 rounded-full bg-amber-400 animate-pulse"></span> Reconnecting...`;
+      } else if (state === 'failed') {
+        connStatus.className = "inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-red-500/20 text-red-400 border border-red-500/30";
+        connStatus.innerHTML = `<span class="w-2 h-2 rounded-full bg-red-400"></span> Lost connection — reload page`;
+      } else {
+        connStatus.className = "inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-red-500/20 text-red-400 border border-red-500/30";
+        connStatus.innerHTML = `<span class="w-2 h-2 rounded-full bg-red-400 animate-pulse"></span> Disconnected`;
+      }
     }
   </script>
 </body>
